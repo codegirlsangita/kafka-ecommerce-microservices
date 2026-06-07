@@ -47,6 +47,32 @@ services:
     networks:
       - kafka-network
 
+  # Jaeger - Distributed tracing backend (receives traces via OTLP)
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: kafka-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - kafka-network
+
+  # Prometheus - Scrapes /metrics endpoints exposed by each service
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: kafka-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090" # Prometheus UI
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Lets the container resolve host.docker.internal on Linux too
+    networks:
+      - kafka-network
+
   # Kafka UI - Optional but helpful for monitoring
   kafka-ui:
     image: provectuslabs/kafka-ui:latest

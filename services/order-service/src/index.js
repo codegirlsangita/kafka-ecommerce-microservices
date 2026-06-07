@@ -1,10 +1,41 @@
+require('dotenv').config();
+require('./tracing'); // Must load before express/mongoose/kafkajs are required, so auto-instrumentation can patch them
+
 const express = require('express');
 const mongoose = require('mongoose');
 const { Kafka } = require('kafkajs');
-require('dotenv').config();
+const {
+  trace,
+  context,
+  propagation,
+  SpanKind,
+  SpanStatusCode,
+} = require('@opentelemetry/api');
+
+const logger = require('./logger');
+const metrics = require('./metrics');
+
+const tracer = trace.getTracer('order-service');
+
+// Kafka headers are Buffers/strings keyed by header name.
+// OTel's propagation API expects a plain string-keyed carrier, so we convert both ways.
+const kafkaHeadersGetter = {
+  keys: (carrier) => Object.keys(carrier || {}),
+  get: (carrier, key) => {
+    const value = carrier?.[key];
+    return value == null ? undefined : value.toString();
+  },
+};
+
+const kafkaHeadersSetter = {
+  set: (carrier, key, value) => {
+    carrier[key] = value;
+  },
+};
 
 const app = express();
 app.use(express.json());
+app.use(metrics.httpMetricsMiddleware);
 
 const SERVICE_NAME = 'order-service';
 const PORT = Number(process.env.ORDER_SERVICE_PORT || 3002);
@@ -46,8 +77,8 @@ const consumer = kafka.consumer({
 mongoose.connect(MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => console.log('Order Service: MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+}).then(() => logger.info('MongoDB connected'))
+  .catch(err => logger.error('MongoDB connection error', { error: err.message }));
 
 // Order Schema
 const orderSchema = new mongoose.Schema({
@@ -85,23 +116,45 @@ app.post('/orders', async (req, res) => {
     await order.save();
 
     // Publish order.created event
-    await producer.send({
-      topic: ORDER_CREATED_TOPIC,
-      messages: [
-        {
-          key: userId, // Partition by userId - all orders from same user go to same partition
-          value: JSON.stringify({
-            orderId: order._id,
-            userId: order.userId,
-            totalAmount: order.totalAmount,
-            itemCount: items.length,
-            timestamp: new Date().toISOString(),
-          }),
-        },
-      ],
-    });
+    // Span kind PRODUCER + injected trace headers let downstream consumers (e.g. payment-service)
+    // continue this same trace, so Jaeger shows the whole HTTP -> Kafka -> consumer chain as one trace.
+    await tracer.startActiveSpan(
+      `${ORDER_CREATED_TOPIC} send`,
+      { kind: SpanKind.PRODUCER, attributes: { 'messaging.system': 'kafka', 'messaging.destination': ORDER_CREATED_TOPIC } },
+      async (span) => {
+        try {
+          const headers = {};
+          propagation.inject(context.active(), headers, kafkaHeadersSetter);
 
-    console.log(`[ORDER SERVICE] Published order.created event for order: ${order._id}`);
+          await producer.send({
+            topic: ORDER_CREATED_TOPIC,
+            messages: [
+              {
+                key: userId, // Partition by userId - all orders from same user go to same partition
+                headers,
+                value: JSON.stringify({
+                  orderId: order._id,
+                  userId: order.userId,
+                  totalAmount: order.totalAmount,
+                  itemCount: items.length,
+                  timestamp: new Date().toISOString(),
+                }),
+              },
+            ],
+          });
+
+          metrics.kafkaMessagesProducedTotal.inc({ topic: ORDER_CREATED_TOPIC });
+        } catch (error) {
+          span.recordException(error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+          throw error;
+        } finally {
+          span.end();
+        }
+      }
+    );
+
+    logger.info('Published order.created event', { orderId: order._id.toString() });
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -113,7 +166,7 @@ app.post('/orders', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error creating order:', error.message);
+    logger.error('Error creating order', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
@@ -139,6 +192,12 @@ app.get('/orders/:id', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Endpoint: Prometheus scrape target
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', metrics.register.contentType);
+  res.end(await metrics.register.metrics());
 });
 
 app.get('/health', async (req, res) => {
@@ -167,25 +226,48 @@ async function startConsumer() {
     // eachMessage callback is called for each message received
     await consumer.run({
       eachMessage: async ({ topic, partition, message }) => {
-        try {
-          const event = JSON.parse(message.value.toString());
-          console.log(
-            `[ORDER SERVICE] Received user.created event:`,
-            event,
-            `\n  Partition: ${partition}, Offset: ${message.offset}`
-          );
+        // Extract the trace context the producer injected into headers, so this
+        // span joins the SAME trace as the original "create user" HTTP request —
+        // that's what lets Jaeger show the full cross-service journey.
+        const parentContext = propagation.extract(context.active(), message.headers || {}, kafkaHeadersGetter);
 
-          // Store user info or prepare for orders
-          // In real scenario, you might log this to trigger welcome campaigns, etc.
-        } catch (error) {
-          console.error('Error processing message:', error.message);
-        }
+        await tracer.startActiveSpan(
+          `${topic} process`,
+          { kind: SpanKind.CONSUMER, attributes: {
+            'messaging.system': 'kafka',
+            'messaging.destination': topic,
+            'messaging.kafka.partition': partition,
+            'messaging.kafka.offset': message.offset,
+          } },
+          parentContext,
+          async (span) => {
+            try {
+              const event = JSON.parse(message.value.toString());
+              logger.info('Received user.created event', {
+                event,
+                partition,
+                offset: message.offset,
+              });
+
+              metrics.kafkaMessagesConsumedTotal.inc({ topic });
+
+              // Store user info or prepare for orders
+              // In real scenario, you might log this to trigger welcome campaigns, etc.
+            } catch (error) {
+              span.recordException(error);
+              span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+              logger.error('Error processing message', { error: error.message });
+            } finally {
+              span.end();
+            }
+          }
+        );
       },
     });
 
-    console.log('✓ Order Service: Consumer listening to user.created topic');
+    logger.info('Consumer listening to user.created topic');
   } catch (error) {
-    console.error('Error starting consumer:', error);
+    logger.error('Error starting consumer', { error: error.message });
   }
 }
 
@@ -193,25 +275,25 @@ async function startConsumer() {
 async function start() {
   try {
     await producer.connect();
-    console.log('✓ Order Service: Kafka Producer connected');
+    logger.info('Kafka Producer connected');
 
     await consumer.connect();
-    console.log('✓ Order Service: Kafka Consumer connected');
+    logger.info('Kafka Consumer connected');
 
     await startConsumer();
 
     app.listen(PORT, () => {
-      console.log(`Order Service running on port ${PORT}`);
+      logger.info(`Order Service running on port ${PORT}`);
     });
   } catch (error) {
-    console.error('Failed to start Order Service:', error);
+    logger.error('Failed to start Order Service', { error: error.message });
     process.exit(1);
   }
 }
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
-  console.log('Shutting down Order Service...');
+  logger.info('Shutting down Order Service...');
   await producer.disconnect();
   await consumer.disconnect();
   process.exit(0);
