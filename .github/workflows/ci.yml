@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            services/user-service/package-lock.json
+            services/order-service/package-lock.json
+            services/payment-service/package-lock.json
+            services/notification-service/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install service dependencies
+        run: |
+          npm ci --prefix services/user-service
+          npm ci --prefix services/order-service
+          npm ci --prefix services/payment-service
+          npm ci --prefix services/notification-service
+
+      - name: Syntax validation
+        run: npm run check:syntax

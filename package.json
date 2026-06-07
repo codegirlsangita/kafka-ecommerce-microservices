@@ -1,0 +1,33 @@
+{
+  "name": "kafka-ecommerce-microservices",
+  "version": "1.0.0",
+  "description": "Event-driven e-commerce microservices with Node.js, Kafka, and MongoDB",
+  "main": "README.md",
+  "scripts": {
+    "infra:up": "docker-compose up -d",
+    "infra:down": "docker-compose down",
+    "infra:logs": "docker-compose logs -f",
+    "topics:create": "node scripts/create-topics.js",
+    "workflow:test": "node scripts/test-workflow.js",
+    "install:all": "npm install && npm --prefix services/user-service install && npm --prefix services/order-service install && npm --prefix services/payment-service install && npm --prefix services/notification-service install",
+    "check:syntax": "node --check scripts/create-topics.js && node --check scripts/test-workflow.js && node --check services/user-service/src/index.js && node --check services/order-service/src/index.js && node --check services/payment-service/src/index.js && node --check services/notification-service/src/index.js",
+    "user-service": "cd services/user-service && npm start",
+    "order-service": "cd services/order-service && npm start",
+    "payment-service": "cd services/payment-service && npm start",
+    "notification-service": "cd services/notification-service && npm start"
+  },
+  "keywords": [
+    "kafka",
+    "microservices",
+    "nodejs",
+    "ecommerce"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Sangita Dev",
+  "license": "MIT",
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  }
+}
